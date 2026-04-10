@@ -1,0 +1,11 @@
+django
+djangorestframework
+langchain
+langchain-groq
+langchain-google-genai
+chromadb
+sentence-transformers
+faster-whisper
+requests
+python-dotenv
+ 
