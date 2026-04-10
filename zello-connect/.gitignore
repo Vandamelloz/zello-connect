@@ -1,0 +1,12 @@
+# Ambiente Virtual
+.ambv/
+venv/
+env/
+
+# Segurança
+.env
+
+# Arquivos temporários do Python
+__pycache__/
+*.py[cod]
+pegar_id.py
