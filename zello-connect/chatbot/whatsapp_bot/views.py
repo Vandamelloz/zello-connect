@@ -10,7 +10,7 @@ from groq import Groq
 # Carrega as variáveis do ambiente
 load_dotenv()
 
-# --- CHAVES DO SISTEMA ---
+# --- CHAVES E CONFIGURAÇÕES ---
 CHATWOOT_ACCOUNT_ID = os.getenv("CHATWOOT_ACCOUNT_ID")
 CHATWOOT_API_TOKEN = os.getenv("CHATWOOT_API_TOKEN")
 CHATWOOT_INBOX_ID = int(os.getenv("CHATWOOT_INBOX_ID", 0))
@@ -19,193 +19,256 @@ OCR_API_KEY = os.getenv("OCR_API_KEY")
 
 CHATWOOT_URL = "https://app.chatwoot.com/api/v1"
 WAHA_URL = "http://localhost:3000"
-
 HEADERS = {
     "api_access_token": CHATWOOT_API_TOKEN,
     "Content-Type": "application/json"
 }
 
-# Inicializa o cliente da Groq se a chave existir
+# Inicializa o cliente da Groq
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
-def buscar_ou_criar_contato(remetente_completo):
-    url_busca = f"{CHATWOOT_URL}/accounts/{CHATWOOT_ACCOUNT_ID}/contacts/search?q={remetente_completo}"
-    res_busca = requests.get(url_busca, headers=HEADERS).json()
-    
-    if res_busca.get('payload') and len(res_busca['payload']) > 0:
-        return res_busca['payload'][0]['id']
+# Memória RAM para o histórico do Chat (MVP)
+HISTORICO_MEMORIA = {}
+
+# ==========================================
+# 1. INTEGRAÇÃO CHATWOOT (Contatos e Conversas)
+# ==========================================
+def buscar_contato_e_conversa(fone):
+    try:
+        # Busca ou cria o contato
+        res = requests.get(f"{CHATWOOT_URL}/accounts/{CHATWOOT_ACCOUNT_ID}/contacts/search?q={fone}", headers=HEADERS).json()
+        payload_busca = res.get('payload') or []
         
-    url_cria = f"{CHATWOOT_URL}/accounts/{CHATWOOT_ACCOUNT_ID}/contacts"
-    dados = {"name": f"Paciente {remetente_completo[:8]}...", "identifier": remetente_completo}
-    res_cria = requests.post(url_cria, headers=HEADERS, json=dados).json()
-    return res_cria['payload']['contact']['id']
+        if payload_busca:
+            c_id = payload_busca[0].get('id')
+        else:
+            res_cria = requests.post(f"{CHATWOOT_URL}/accounts/{CHATWOOT_ACCOUNT_ID}/contacts", headers=HEADERS, json={"name": f"Paciente {fone[:8]}", "identifier": fone}).json()
+            c_id = res_cria.get('payload', {}).get('contact', {}).get('id')
+        
+        # Busca ou cria a conversa aberta
+        res_c = requests.get(f"{CHATWOOT_URL}/accounts/{CHATWOOT_ACCOUNT_ID}/contacts/{c_id}/conversations", headers=HEADERS).json()
+        lista_conversas = res_c.get('payload') or []
+        for conv in lista_conversas:
+            if conv.get('inbox_id') == CHATWOOT_INBOX_ID and conv.get('status') == 'open': 
+                return conv.get('id')
+        
+        res_conv = requests.post(f"{CHATWOOT_URL}/accounts/{CHATWOOT_ACCOUNT_ID}/conversations", headers=HEADERS, json={"inbox_id": CHATWOOT_INBOX_ID, "contact_id": c_id}).json()
+        return res_conv.get('id')
+    except Exception as e:
+        print(f"❌ Erro Chatwoot: {e}")
+        return None
 
-def buscar_ou_criar_conversa(contact_id):
-    url_busca = f"{CHATWOOT_URL}/accounts/{CHATWOOT_ACCOUNT_ID}/contacts/{contact_id}/conversations"
-    res_busca = requests.get(url_busca, headers=HEADERS).json()
+# ==========================================
+# 2. INTELIGÊNCIA ARTIFICIAL: ÁUDIO E IMAGEM
+# ==========================================
+def processar_audio(media_url):
+    try:
+        res = requests.get(media_url, timeout=10)
+        if res.status_code == 200:
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".ogg")
+            tmp.write(res.content)
+            tmp.close()
+            
+            with open(tmp.name, "rb") as f:
+                trans = groq_client.audio.transcriptions.create(
+                    file=("audio.ogg", f.read()), 
+                    model="whisper-large-v3", 
+                    language="pt"
+                )
+            # Devolvemos um dicionário para podermos enviar o arquivo pro Chatwoot depois
+            return {"texto": trans.text, "caminho": tmp.name, "tipo_arquivo": "audio/ogg", "nome": "audio.ogg"}
+    except Exception as e:
+        print(f"❌ Erro Áudio: {e}")
+    return None
+
+def processar_imagem(media_url):
+    try:
+        res = requests.get(media_url, timeout=10)
+        if res.status_code == 200:
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+            tmp.write(res.content)
+            tmp.close()
+            
+            with open(tmp.name, 'rb') as f:
+                r = requests.post(
+                    'https://api.ocr.space/parse/image', 
+                    files={'file': f}, 
+                    data={'apikey': OCR_API_KEY, 'language': 'por', 'OCREngine': '2', 'scale': 'true'}
+                ).json()
+                
+                texto = r.get('ParsedResults', [{}])[0].get('ParsedText', '')
+            return {"texto": texto.strip(), "caminho": tmp.name, "tipo_arquivo": "image/jpeg", "nome": "exame.jpg"}
+    except Exception as e:
+        print(f"❌ Erro Imagem: {e}")
+    return None
+
+# ==========================================
+# 3. INTELIGÊNCIA ARTIFICIAL: CÉREBRO CONVERSACIONAL
+# ==========================================
+def gerar_resposta_zello(texto_paciente, fone):
+    global HISTORICO_MEMORIA
+    texto_limpo = str(texto_paciente).strip()
     
-    for conv in res_busca.get('payload', []):
-        if conv.get('inbox_id') == CHATWOOT_INBOX_ID and conv.get('status') == 'open':
-            return conv['id'], False
-            
-    url_cria = f"{CHATWOOT_URL}/accounts/{CHATWOOT_ACCOUNT_ID}/conversations"
-    dados = {"inbox_id": CHATWOOT_INBOX_ID, "contact_id": contact_id}
-    res_cria = requests.post(url_cria, headers=HEADERS, json=dados).json()
-    return res_cria['id'], True
-
-# --- 1. FUNÇÃO DE IA PARA ÁUDIO ---
-def baixar_e_transcrever_audio(media_url):
+    if not texto_limpo:
+        texto_limpo = "[Mídia sem texto detectado]"
+        
     try:
-        print(f"📥 Tentando baixar áudio...")
-        res = requests.get(media_url)
-        if res.status_code == 200:
-            tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".ogg")
-            tmp_file.write(res.content)
-            tmp_file.close()
-            texto_transcrito = "[Transcrição Indisponível]"
-            
-            if groq_client:
-                print("🧠 Enviando áudio para a Groq Whisper...")
-                with open(tmp_file.name, "rb") as audio_file:
-                    transcription = groq_client.audio.transcriptions.create(
-                        file=("audio.ogg", audio_file.read()), model="whisper-large-v3", language="pt"
-                    )
-                    texto_transcrito = transcription.text
-            return {"texto": texto_transcrito, "caminho": tmp_file.name, "tipo_arquivo": "audio/ogg", "nome": "audio.ogg"}
-    except Exception as e:
-        print(f"❌ Erro Crítico na IA de Áudio: {e}")
-    return None
+        if fone not in HISTORICO_MEMORIA: 
+            prompt = "Você é Zello, assistente do Hospital IBR. Aja de forma empática. Responda estritamente sobre a queixa do paciente. Faça UMA pergunta por vez."
+            HISTORICO_MEMORIA[fone] = [{"role": "system", "content": prompt}]
+        
+        HISTORICO_MEMORIA[fone].append({"role": "user", "content": texto_limpo})
+        
+        if len(HISTORICO_MEMORIA[fone]) > 7:
+            HISTORICO_MEMORIA[fone] = [HISTORICO_MEMORIA[fone][0]] + HISTORICO_MEMORIA[fone][-6:]
 
-# --- 2. FUNÇÃO DE VISÃO COMPUTACIONAL (OCR AVANÇADO) ---
-def baixar_e_ler_imagem(media_url):
-    try:
-        print(f"📥 Tentando baixar imagem...")
-        res = requests.get(media_url)
-        if res.status_code == 200:
-            tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-            tmp_file.write(res.content)
-            tmp_file.close()
-            texto_extraido = "[Nenhum texto legível encontrado na imagem]"
-            
-            if OCR_API_KEY:
-                print("👁️ Enviando imagem para leitura (OCR.space - Motor Avançado)...")
-                with open(tmp_file.name, 'rb') as img_file:
-                    resposta_ocr = requests.post(
-                        'https://api.ocr.space/parse/image',
-                        files={'file': img_file},
-                        data={
-                            'apikey': OCR_API_KEY, 
-                            'language': 'por',
-                            'OCREngine': '2',  # Motor 2: Melhor para caracteres difíceis e manuscritos
-                            'scale': 'true'    # Melhora a resolução da foto
-                        }
-                    ).json()
-                    
-                    if not resposta_ocr.get('IsErroredOnProcessing'):
-                        resultados = resposta_ocr.get('ParsedResults', [])
-                        if resultados and resultados[0].get('ParsedText'):
-                            texto_extraido = resultados[0]['ParsedText'].strip()
-            return {"texto": texto_extraido, "caminho": tmp_file.name, "tipo_arquivo": "image/jpeg", "nome": "exame.jpg"}
+        comp = groq_client.chat.completions.create(
+            messages=HISTORICO_MEMORIA[fone], 
+            model="mixtral-8x7b-32768", 
+            temperature=0.3,
+            timeout=10.0
+        )
+        resposta_ia = comp.choices[0].message.content
+        
+        HISTORICO_MEMORIA[fone].append({"role": "assistant", "content": resposta_ia})
+        return resposta_ia
+        
     except Exception as e:
-        print(f"❌ Erro Crítico no OCR: {e}")
-    return None
+        print(f"❌ Erro na IA (Ativando Plano B Expandido): {e}")
+        if fone in HISTORICO_MEMORIA and len(HISTORICO_MEMORIA[fone]) > 1: 
+            HISTORICO_MEMORIA[fone].pop()
+            
+        # ==========================================
+        # PLANO B EXPANDIDO: Foco no público idoso e triagem
+        # ==========================================
+        txt_lower = texto_limpo.lower()
+        
+        # 1. EMERGÊNCIA (Prioridade Máxima)
+        if any(word in txt_lower for word in ["falta de ar", "peito", "coração", "desmaio", "emergência", "urgência", "sangramento"]):
+            return "🤖 Zello: ALERTA: Pelo que você me disse, isso pode ser uma emergência. Por favor, venha IMEDIATAMENTE para o pronto-socorro do Hospital IBR ou ligue para o SAMU (192)."
+            
+        # 2. Dor e Mal-estar (Triagem)
+        elif any(word in txt_lower for word in ["dor", "mal", "doendo", "febre", "ruim", "tontura", "fraco"]):
+            return "🤖 Zello: Sinto muito que não esteja se sentindo bem. Onde exatamente está o incômodo e desde quando começou?"
+            
+        # 3. Consultas e Agendamentos
+        elif any(word in txt_lower for word in ["consulta", "marcar", "agendar", "médico", "doutor"]):
+            return "🤖 Zello: Claro, posso te ajudar a marcar sua consulta. Você sabe qual é a especialidade do médico que precisa (por exemplo, cardiologista, ortopedista)?"
+            
+        # 4. Exames e Resultados
+        elif any(word in txt_lower for word in ["exame", "resultado", "raio-x", "ultrassom", "sangue"]):
+            return "🤖 Zello: Certo, para marcação ou resultados de exames, um de nossos atendentes vai acessar a sua ficha agora mesmo para te ajudar. Só um instante."
+            
+        # 5. Receitas e Medicamentos
+        elif any(word in txt_lower for word in ["receita", "remédio", "medicamento", "comprimido"]):
+            return "🤖 Zello: Entendi. Se precisar renovar ou mostrar uma receita, você pode mandar a foto dela por aqui mesmo. Um atendente humano vai conferir para você."
+            
+        # 6. Cancelamentos
+        elif any(word in txt_lower for word in ["cancelar", "desmarcar", "remarcar", "não vou poder"]):
+            return "🤖 Zello: Tudo bem, imprevistos acontecem. Vou pedir para nossa equipe confirmar esse cancelamento ou reagendamento para você agorinha."
+            
+        # 7. Preços e Convênios
+        elif any(word in txt_lower for word in ["convênio", "plano", "preço", "valor", "pagar", "unimed"]):
+            return "🤖 Zello: Nós trabalhamos com diversos convênios e atendimentos particulares. Vou transferir para o setor financeiro te passar as informações certinhas. Aguarde na linha."
+            
+        # 8. Dificuldade ou Pedido por Humano
+        elif any(word in txt_lower for word in ["atendente", "pessoa", "humano", "não sei", "difícil", "ajuda", "confuso"]):
+            return "🤖 Zello: Não se preocupe, estou aqui para facilitar. Vou chamar um atendente (uma pessoa de verdade) para conversar com você e resolver tudo com calma."
+            
+        # 9. Cumprimentos
+        elif any(word in txt_lower for word in ["oi", "olá", "bom dia", "boa tarde", "boa noite"]):
+            return "🤖 Zello: Olá! Sou a Zello, a assistente virtual do Hospital IBR. Estou aqui para cuidar de você. Como posso te ajudar hoje?"
+            
+        # 10. Agradecimentos e Despedidas
+        elif any(word in txt_lower for word in ["obrigado", "obrigada", "deus abençoe", "valeu", "tchau"]):
+            return "🤖 Zello: Por nada! Fico muito feliz em ajudar. O Hospital IBR deseja muita saúde. Se precisar de mais alguma coisa, é só chamar!"
+            
+        # 11. Resposta Genérica (Se não cair em nada)
+        else:
+            return "🤖 Zello: Entendi o que você disse. Já registrei sua mensagem aqui e, para te dar a melhor resposta, um de nossos atendentes vai assumir a conversa em instantes. Por favor, aguarde só um pouquinho."
 
+# ==========================================
+# 4. WEBHOOKS PRINCIPAIS
+# ==========================================
 @csrf_exempt
 def waha_webhook(request):
-    """VIA DE IDA: WAHA -> Django -> Chatwoot"""
+    """VIA DE IDA: WhatsApp -> Django -> Chatwoot -> Zello"""
     if request.method == 'POST':
         try:
-            payload = json.loads(request.body)
-            event_type = payload.get('event')
+            payload = json.loads(request.body) or {}
+            data = payload.get('payload') or {}
+            fone = data.get('from')
             
-            if event_type in ['message', 'message.any']:
-                data = payload.get('payload', {})
-                mensagem_texto = data.get('body', '')
-                remetente_completo = data.get('from', '')
-                
-                # BUSCANDO DADOS DO PACOTE
-                _data_interna = data.get('_data', {})
-                msg_type = _data_interna.get('type', '')
-                mimetype = data.get('media', {}).get('mimetype', '')
-                media_url = data.get('media', {}).get('url', '')
-                
-                dados_midia = None
-                
-                # --- TRIAGEM DE ACESSIBILIDADE ---
-                if data.get('hasMedia'):
-                    if msg_type in ['ptt', 'audio', 'voice'] or 'audio' in mimetype:
-                        print("\n🎙️ [IA] Áudio detectado no pacote!")
-                        dados_midia = baixar_e_transcrever_audio(media_url)
-                        if dados_midia:
-                            mensagem_texto = f"🎙️ *[Áudio do Paciente]*\n*Transcrição:* {dados_midia['texto']}"
-                    
-                    elif msg_type == 'image' or 'image' in mimetype:
-                        print("\n🖼️ [IA] Imagem/Exame detectado no pacote!")
-                        dados_midia = baixar_e_ler_imagem(media_url)
-                        if dados_midia:
-                            mensagem_texto = f"🖼️ *[Documento Enviado]*\n*Texto Extraído da Imagem:* \n{dados_midia['texto']}"
-                
-                # Ignorar se não tiver texto nenhum nem mídia
-                if not mensagem_texto and not dados_midia:
-                    return JsonResponse({"status": "ignorado sem texto/midia"}, status=200)
+            # Ignora pacotes vazios
+            if not fone: return JsonResponse({"status": "ignorado"}, status=200)
+            
+            mensagem_exibicao = data.get('body', '')
+            media_info = data.get('media') or {}
+            msg_tipo = (data.get('_data') or {}).get('type', '')
+            dados_midia = None
 
-                contact_id = buscar_ou_criar_contato(remetente_completo)
-                conversation_id, conversa_nova = buscar_ou_criar_conversa(contact_id)
-                url_msg = f"{CHATWOOT_URL}/accounts/{CHATWOOT_ACCOUNT_ID}/conversations/{conversation_id}/messages"
+            # --- PROCESSAMENTO DE MÍDIAS (Acessibilidade) ---
+            if data.get('hasMedia'):
+                if msg_tipo in ['ptt', 'audio', 'voice'] or 'audio' in media_info.get('mimetype', ''):
+                    dados_midia = processar_audio(media_info.get('url'))
+                    if dados_midia:
+                        mensagem_exibicao = f"🎙️ [Áudio]: {dados_midia['texto']}"
+                        
+                elif msg_tipo == 'image' or 'image' in media_info.get('mimetype', ''):
+                    dados_midia = processar_imagem(media_info.get('url'))
+                    if dados_midia:
+                        mensagem_exibicao = f"🖼️ [Imagem/Receita]: {dados_midia['texto']}"
+
+            # --- ENVIO PARA CHATWOOT (Humano visualizar) ---
+            conv_id = buscar_contato_e_conversa(fone)
+            if conv_id:
+                url_msg = f"{CHATWOOT_URL}/accounts/{CHATWOOT_ACCOUNT_ID}/conversations/{conv_id}/messages"
                 
-                # --- MÁGICA DO ENVIO UNIVERSAL (TEXTO / ÁUDIO / IMAGEM) ---
+                # Se tem arquivo (áudio ou foto), envia como anexo
                 if dados_midia and dados_midia.get('caminho'):
-                    cabecalhos_arquivo = {"api_access_token": CHATWOOT_API_TOKEN} 
-                    dados_texto = {
-                        "content": mensagem_texto,
-                        "message_type": "incoming",
-                        "private": "false"
-                    }
-                    try:
-                        with open(dados_midia['caminho'], 'rb') as f:
-                            arquivos = [('attachments[]', (dados_midia['nome'], f, dados_midia['tipo_arquivo']))]
-                            requests.post(url_msg, headers=cabecalhos_arquivo, data=dados_texto, files=arquivos)
-                    finally:
-                        if os.path.exists(dados_midia['caminho']):
-                            os.remove(dados_midia['caminho'])
+                    with open(dados_midia['caminho'], 'rb') as f:
+                        requests.post(
+                            url_msg, 
+                            headers={"api_access_token": CHATWOOT_API_TOKEN}, 
+                            data={"content": f"*[Paciente]*: {mensagem_exibicao}", "message_type": "incoming"},
+                            files=[('attachments[]', (dados_midia['nome'], f, dados_midia['tipo_arquivo']))]
+                        )
+                    os.remove(dados_midia['caminho']) # Apaga do servidor após o envio
                 else:
-                    dados_msg = {
-                        "content": f"*[Paciente]*\n{mensagem_texto}",
-                        "message_type": "incoming",
-                        "private": False
-                    }
-                    requests.post(url_msg, headers=HEADERS, json=dados_msg)
+                    # Mensagem de texto normal
+                    requests.post(url_msg, headers=HEADERS, json={"content": f"*[Paciente]*: {mensagem_exibicao}", "message_type": "incoming"})
+                
+                # --- RESPOSTA DA IA ---
+                # A Zello lê a mensagem (texto, transcrição ou OCR) e responde
+                resposta_zello = gerar_resposta_zello(mensagem_exibicao, fone)
+                requests.post(url_msg, headers=HEADERS, json={"content": resposta_zello, "message_type": "outgoing"})
 
-                # Robô de Triagem Inicial
-                if conversa_nova:
-                    msg_robo = "🤖 *Zello Connect:* Olá! Sou o assistente virtual do hospital. Para agilizar seu atendimento, por favor, me diga seu *nome completo* e o que precisa hoje?"
-                    requests.post(f"{WAHA_URL}/api/sendText", json={
-                        "chatId": remetente_completo, "text": msg_robo, "session": "default"
-                    })
-
-            return JsonResponse({"status": "recebido"}, status=200)
-
-        except Exception as e:
-            print(f"Erro na IDA: {e}")
-            return JsonResponse({"erro": str(e)}, status=500)
+            return JsonResponse({"status": "sucesso"}, status=200)
             
-    return JsonResponse({"erro": "Apenas POST"}, status=405)
+        except Exception as e:
+            print(f"❌ Erro WAHA Webhook: {e}")
+            return JsonResponse({"status": "erro_tratado"}, status=200)
+            
+    return JsonResponse({"erro": "Método não permitido"}, status=405)
 
 @csrf_exempt
 def chatwoot_webhook(request):
-    """VIA DE VOLTA: Chatwoot -> Django -> WAHA"""
+    """VIA DE VOLTA: Chatwoot -> Django -> WhatsApp"""
     if request.method == 'POST':
         try:
-            payload = json.loads(request.body)
-            evento = payload.get('event')
-            tipo = payload.get('message_type')
-            conteudo = payload.get('content', '')
+            payload = json.loads(request.body) or {}
             
-            if evento == 'message_created' and tipo == 'outgoing':
-                remetente_completo = payload.get('conversation', {}).get('meta', {}).get('sender', {}).get('identifier')
-                if remetente_completo:
-                    requests.post(f"{WAHA_URL}/api/sendText", json={"chatId": remetente_completo, "text": conteudo, "session": "default"})
-            return JsonResponse({"status": "recebido"}, status=200)
+            # Garante que só reage a mensagens enviadas (seja pelo atendente ou espelhadas pela IA)
+            if payload.get('event') == 'message_created' and payload.get('message_type') == 'outgoing':
+                fone = payload.get('conversation', {}).get('meta', {}).get('sender', {}).get('identifier')
+                conteudo = payload.get('content', '')
+                
+                if fone and conteudo:
+                    requests.post(f"{WAHA_URL}/api/sendText", json={"chatId": fone, "text": conteudo, "session": "default"})
+                    
+            return JsonResponse({"status": "sucesso"}, status=200)
         except Exception as e:
-            return JsonResponse({"erro": str(e)}, status=500)
-    return JsonResponse({"erro": "Apenas POST"}, status=405)
+            print(f"❌ Erro Chatwoot Webhook: {e}")
+            return JsonResponse({"status": "erro_tratado"}, status=200)
+            
+    return JsonResponse({"erro": "Método não permitido"}, status=405)
