@@ -2,7 +2,10 @@ import os
 import json
 import requests
 import tempfile
+import datetime
+from django.utils import timezone
 from dotenv import load_dotenv
+from .models import Medico, Consulta, Paciente
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from groq import Groq
@@ -38,6 +41,7 @@ def ja_processado(msg_id):
     if len(MENSAGENS_PROCESSADAS) > 500:
         MENSAGENS_PROCESSADAS.clear()
     return False
+
 def enviar_waha(fone, texto):
     try:
         if "18343939559615" in fone or "@lid" in fone:
@@ -116,7 +120,7 @@ def buscar_contato_e_conversa(fone):
         return None
 
 
-# 2. MÍDIA- Onde ocorre o processo de acessibilidade audiovisual
+# 2. MÍDIA - Acessibilidade audiovisual
 
 def extrair_info_midia(data):
     media = data.get('media') or {}
@@ -207,31 +211,54 @@ def processar_imagem(media_url):
         print(f"❌ Erro Imagem: {e}")
     return None
 
-# 3. IA — Zello
+
+# 3. IA — Zello (Com Limites Rígidos)
 
 def gerar_resposta_zello(texto_paciente, fone):
     global HISTORICO_MEMORIA
     texto_limpo = str(texto_paciente).strip() or "[Mídia sem texto detectado]"
 
     try:
+        medicos_ativos = Medico.objects.filter(ativo=True)
+        especialidades_disponiveis = ", ".join(list(set([m.especialidade for m in medicos_ativos])))
+        lista_medicos = ", ".join([f"Dr. {m.nome} ({m.especialidade})" for m in medicos_ativos])
+
+       
+        agora = datetime.datetime.now()
+        dias_semana = ["Domingo", "Segunda-feira", "Terça-feira", "Quarta-feira", "Quinta-feira", "Sexta-feira", "Sábado"]
+        hoje_str = f"{agora.strftime('%d/%m/%Y')} ({dias_semana[int(agora.strftime('%w'))]})"
+        
+        calendario = []
+        for i in range(7):
+            data_futura = agora + datetime.timedelta(days=i)
+            nome_dia = dias_semana[int(data_futura.strftime('%w'))]
+            calendario.append(f"{nome_dia} ({data_futura.strftime('%d/%m/%Y')})")
+        calendario_str = " | ".join(calendario)
+
         if fone not in HISTORICO_MEMORIA:
             prompt = (
-                "Você é Zello, assistente virtual do Hospital IBR. "
-                "Aja de forma empática e acolhedora. "
-                "Responda somente sobre assuntos relacionados ao atendimento hospitalar. "
-                "Faça UMA pergunta por vez."
+                f"Você é Zello, assistente do Hospital IBR. Seja extremamente acolhedora, natural e empática. "
+                f"Hoje é {hoje_str}. Para não errar os dias da semana, baseie-se estritamente neste calendário: {calendario_str}.\n\n"
+                f"REGRAS DE AGENDAMENTO (NUNCA QUEBRE ESTAS REGRAS): "
+                f"1. Horário de funcionamento: Segunda a Sexta, das 08:00 às 18:00. NUNCA marque consultas à noite ou fora desse horário. Se o paciente pedir, informe o horário correto. "
+                f"2. Especialidades: {especialidades_disponiveis}. Médicos: {lista_medicos}. "
+                f"3. CONVÊNIOS PERMITIDOS: Aceitamos EXCLUSIVAMENTE Unimed, Bradesco, Amil, SulAmérica ou Particular. "
+                f"SE o paciente informar qualquer outro convênio (como Saúde Caixa, Hapvida, Cassi, etc), você DEVE informar educadamente que não aceitamos e perguntar se ele deseja ser atendido na modalidade Particular.\n\n"
+                f"COMANDOS DE SISTEMA (OBRIGATÓRIOS PARA O SISTEMA FUNCIONAR): "
+                f"- MARCAR: Somente quando o paciente confirmar a marcação com as 4 informações (Médico, Data válida, Nome, Convênio válido), agradeça e adicione NO FINAL EXATAMENTE: [CONFIRMAR: Nome do Medico | YYYY-MM-DD HH:MM | Nome do Paciente | Plano de Saude]. "
+                f"- CANCELAR: Se o paciente pedir para cancelar, avise que a consulta foi cancelada com sucesso e adicione NO FINAL EXATAMENTE a tag: [CANCELAR]."
             )
             HISTORICO_MEMORIA[fone] = [{"role": "system", "content": prompt}]
 
         HISTORICO_MEMORIA[fone].append({"role": "user", "content": texto_limpo})
 
-        if len(HISTORICO_MEMORIA[fone]) > 7:
-            HISTORICO_MEMORIA[fone] = [HISTORICO_MEMORIA[fone][0]] + HISTORICO_MEMORIA[fone][-6:]
+        if len(HISTORICO_MEMORIA[fone]) > 11:
+            HISTORICO_MEMORIA[fone] = [HISTORICO_MEMORIA[fone][0]] + HISTORICO_MEMORIA[fone][-10:]
 
         comp = groq_client.chat.completions.create(
             messages=HISTORICO_MEMORIA[fone],
             model="llama-3.3-70b-versatile",
-            temperature=0.3,
+            temperature=0.3, 
             timeout=10.0
         )
         resposta_ia = comp.choices[0].message.content
@@ -239,34 +266,13 @@ def gerar_resposta_zello(texto_paciente, fone):
         return resposta_ia
 
     except Exception as e:
-        print(f"❌ Erro na IA (Plano B): {e}")
+        print(f"❌ Erro na IA: {e}")
         if fone in HISTORICO_MEMORIA and len(HISTORICO_MEMORIA[fone]) > 1:
             HISTORICO_MEMORIA[fone].pop()
 
-    # --- PLANO B ---
-    txt_lower = texto_limpo.lower()
-    if any(w in txt_lower for w in ["falta de ar", "peito", "coração", "desmaio", "emergência", "urgência", "sangramento"]):
-        return "Zello (IBR): ALERTA: Pelo que você me disse, isso pode ser uma emergência. Por favor, venha IMEDIATAMENTE para o pronto-socorro do Hospital IBR ou ligue para o SAMU (192)."
-    elif any(w in txt_lower for w in ["dor", "mal", "doendo", "febre", "ruim", "tontura", "fraco"]):
-        return "Zello (IBR): Sinto muito que não esteja se sentindo bem. Onde exatamente está o incômodo e desde quando começou?"
-    elif any(w in txt_lower for w in ["consulta", "marcar", "agendar", "médico", "doutor"]):
-        return "Zello (IBR): Claro, posso te ajudar a marcar sua consulta. Você sabe qual especialidade precisa (ex: cardiologista, ortopedista)?"
-    elif any(w in txt_lower for w in ["exame", "resultado", "raio-x", "ultrassom", "sangue"]):
-        return "Zello (IBR): Certo, um atendente vai acessar sua ficha agora mesmo. Só um instante."
-    elif any(w in txt_lower for w in ["receita", "remédio", "medicamento", "comprimido"]):
-        return "Zello (IBR): Pode mandar a foto da receita por aqui. Um atendente vai conferir para você."
-    elif any(w in txt_lower for w in ["cancelar", "desmarcar", "remarcar"]):
-        return "Zello (IBR): Tudo bem, vou pedir para a equipe confirmar esse reagendamento agora."
-    elif any(w in txt_lower for w in ["convênio", "plano", "preço", "valor", "pagar"]):
-        return "Zello (IBR): Vou transferir para o setor financeiro te passar as informações. Aguarde."
-    elif any(w in txt_lower for w in ["atendente", "pessoa", "humano", "ajuda"]):
-        return "Zello (IBR): Vou chamar um atendente para conversar com você agora mesmo."
-    elif any(w in txt_lower for w in ["oi", "olá", "bom dia", "boa tarde", "boa noite"]):
-        return "Zello (IBR): Olá! Sou a Zello, assistente do Hospital IBR. Como posso te ajudar hoje?"
-    elif any(w in txt_lower for w in ["obrigado", "obrigada", "valeu", "tchau"]):
-        return "Zello (IBR): Por nada! O Hospital IBR deseja muita saúde. Se precisar, é só chamar!"
-    else:
-        return "Zello (IBR): Recebi sua mensagem. Um atendente vai assumir a conversa em instantes. Por favor, aguarde."
+    return "Zello (IBR): Recebi a sua mensagem, mas estou a acessar o sistema. Um instante."
+
+
 
 # 4. WEBHOOK — WAHA → Django → Chatwoot + Zello
 
@@ -278,7 +284,6 @@ def waha_webhook(request):
     try:
         payload = json.loads(request.body) or {}
 
-      
         print(f"🔍 PAYLOAD from={payload.get('payload', {}).get('from')} | keys={list(payload.keys())} | payload_keys={list((payload.get('payload') or {}).keys())}")
 
         data = payload.get('payload') or {}
@@ -290,7 +295,7 @@ def waha_webhook(request):
         fone = data.get('from', '')
         print(f"🔍 fone bruto recebido: '{fone}'")
 
-        # Ignora grupos, broadcasts e mensagens próprias
+    
         if not fone or "@g.us" in fone or "@broadcast" in fone:
             return JsonResponse({"status": "ignorado"}, status=200)
 
@@ -300,7 +305,7 @@ def waha_webhook(request):
         mensagem_exibicao = data.get('body', '')
         dados_midia = None
 
-        # Detecção de mídia
+       
         if data.get('hasMedia'):
             url_midia, mimetype, msg_type = extrair_info_midia(data)
             print(f"🎯 Mídia: type={msg_type}, mime={mimetype}, url={url_midia[:80] if url_midia else 'VAZIA'}")
@@ -329,7 +334,6 @@ def waha_webhook(request):
                 else:
                     mensagem_exibicao = "🖼️ [Imagem recebida — OCR indisponível]"
 
-        # Registra no Chatwoot
         conv_id = buscar_contato_e_conversa(fone)
         if conv_id:
             url_msg = f"{CHATWOOT_URL}/accounts/{CHATWOOT_ACCOUNT_ID}/conversations/{conv_id}/messages"
@@ -356,14 +360,93 @@ def waha_webhook(request):
                     }
                 )
 
-      
+        
             resposta_zello_pura = gerar_resposta_zello(mensagem_exibicao, fone)
-            
+            numero_limpo = fone.split('@')[0].strip()
+
           
-            if resposta_zello_pura.startswith("Zello (IBR):"):
-                resposta_com_emoji = resposta_zello_pura.replace("Zello (IBR):", "🩺 Zello:")
+            if "[CANCELAR]" in resposta_zello_pura:
+                try:
+                
+                    consulta_cancelar = Consulta.objects.filter(
+                        paciente__telefone=numero_limpo, 
+                        status='agendada', 
+                        data_hora__gte=timezone.now()
+                    ).order_by('data_hora').first()
+                    
+                    if consulta_cancelar:
+                        consulta_cancelar.status = 'cancelada'
+                        consulta_cancelar.save()
+                        print(f"✅ CONSULTA CANCELADA NO BANCO: {consulta_cancelar.paciente.nome}")
+                    else:
+                        print("⚠️ IA enviou [CANCELAR], mas nenhuma consulta futura foi encontrada.")
+                except Exception as e:
+                    print(f"❌ Erro ao tentar cancelar consulta no banco: {e}")
+
+            if "[CONFIRMAR:" in resposta_zello_pura:
+                try:
+                    import re
+                    match = re.search(r'\[CONFIRMAR:(.*?)\]', resposta_zello_pura, re.IGNORECASE)
+                    if match:
+                        dados_agendamento = match.group(1).split("|")
+                        
+                        nome_medico_cru = dados_agendamento[0].strip() if len(dados_agendamento) > 0 else "Geral"
+                        data_texto_cru = dados_agendamento[1].strip() if len(dados_agendamento) > 1 else ""
+                        nome_paciente_cru = dados_agendamento[2].strip() if len(dados_agendamento) > 2 else "Não informado"
+                        plano_saude_cru = dados_agendamento[3].strip() if len(dados_agendamento) > 3 else "Particular"
+                        
+                        nome_busca = nome_medico_cru.replace("Dr.", "").replace("Dra.", "").strip()
+                        medico_obj = Medico.objects.filter(nome__icontains=nome_busca).first()
+                        if not medico_obj:
+                            medico_obj = Medico.objects.first() # Prevenção de quebra
+                        
+                        paciente_obj, _ = Paciente.objects.get_or_create(telefone=numero_limpo)
+                        if nome_paciente_cru.lower() not in ["não informado", "desconhecido"]:
+                            paciente_obj.nome = nome_paciente_cru
+                            paciente_obj.save()
+                        
+                        try:
+                            data_consulta_real = timezone.make_aware(datetime.datetime.strptime(data_texto_cru, "%Y-%m-%d %H:%M"))
+                        except ValueError:
+                            print(f"⚠️ A IA errou o formato da data: '{data_texto_cru}'. Salvando para amanhã.")
+                            data_consulta_real = timezone.now() + datetime.timedelta(days=1)
+                        
+                        if medico_obj:
+                            consulta_obj, created = Consulta.objects.get_or_create(
+                                paciente=paciente_obj,
+                                medico=medico_obj,
+                                data_hora=data_consulta_real,
+                                defaults={'status': 'agendada', 'convenio': plano_saude_cru}
+                            )
+                            if created:
+                                print(f"✅ CONSULTA SALVA NO BANCO: {nome_paciente_cru} com {medico_obj.nome}")
+                            else:
+                                print(f"⚠️ Evitada duplicação de consulta para {nome_paciente_cru}.")
+                                if consulta_obj.status != 'agendada':
+                                    consulta_obj.status = 'agendada'
+                                    consulta_obj.save()
+
+                except Exception as e:
+                    print(f"❌ Erro ao salvar consulta no banco: {e}")
+
+       
+            import re
+          
+            resposta_limpa = re.sub(r'\[.*?\]', '', resposta_zello_pura).strip()
+      
+            if not resposta_limpa:
+                if "[CANCELAR]" in resposta_zello_pura:
+                    resposta_limpa = "Tudo certo! Sua consulta foi cancelada com sucesso no sistema. 🩺"
+                elif "[CONFIRMAR" in resposta_zello_pura:
+                    resposta_limpa = "Sua consulta foi agendada com sucesso! Estamos ansiosos para recebê-lo. 🩺"
+                else:
+                    resposta_limpa = "Entendido! Em que mais posso ajudar? 🩺"
+
+
+            if resposta_limpa.startswith("Zello (IBR):"):
+                resposta_com_emoji = resposta_limpa.replace("Zello (IBR):", "🩺 Zello:")
             else:
-                resposta_com_emoji = f"🩺 {resposta_zello_pura}"
+                resposta_com_emoji = f"🩺 {resposta_limpa}"
 
             requests.post(
                 url_msg,
@@ -371,7 +454,6 @@ def waha_webhook(request):
                 json={"content": f"*[Zello]* {resposta_com_emoji}", "message_type": "outgoing"}
             )
 
-          
             print(f"🤖 Zello vai responder para fone='{fone}'")
             enviar_waha(fone, resposta_com_emoji)
 
@@ -382,7 +464,6 @@ def waha_webhook(request):
         import traceback
         traceback.print_exc()
         return JsonResponse({"status": "erro_tratado"}, status=200)
-
 
 
 # 5. WEBHOOK — Chatwoot → Django → WAHA
@@ -403,15 +484,12 @@ def chatwoot_webhook(request):
 
         if event == 'message_created' and msg_type == 'outgoing':
 
-       
             if tipo_conta == 'agent_bot':
                 return JsonResponse({"status": "ignorado_bot"}, status=200)
 
-          
             if conteudo.startswith('*[Paciente]*') or conteudo.startswith('*[Zello]*'):
                 return JsonResponse({"status": "ignorado_espelho"}, status=200)
 
-         
             remetente_email = remetente.get('email', '')
             if not remetente_email:
                 return JsonResponse({"status": "ignorado_sem_email"}, status=200)
