@@ -10,3 +10,4 @@ env/
 __pycache__/
 *.py[cod]
 pegar_id.py
+waha_sessions/

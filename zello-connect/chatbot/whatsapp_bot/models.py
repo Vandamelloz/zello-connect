@@ -3,7 +3,6 @@ from django.db import models
 # 1. Tabela de Pacientes
 class Paciente(models.Model):
     nome = models.CharField(max_length=255, blank=True, null=True)
-    # O telefone é a nossa chave principal para conectar com o WhatsApp (ex: 5577981589819)
     telefone = models.CharField(max_length=20, unique=True) 
     cpf = models.CharField(max_length=14, blank=True, null=True)
     data_cadastro = models.DateTimeField(auto_now_add=True)
@@ -14,13 +13,13 @@ class Paciente(models.Model):
 # 2. Tabela de Médicos
 class Medico(models.Model):
     nome = models.CharField(max_length=255)
-    especialidade = models.CharField(max_length=100) # Ex: Cardiologia, Ortopedia
+    especialidade = models.CharField(max_length=100) 
     ativo = models.BooleanField(default=True)
 
     def __str__(self):
         return f"Dr(a). {self.nome} - {self.especialidade}"
 
-# 3. Tabela de Consultas (Onde a mágica do agendamento acontece)
+# 3. Tabela de Consultas 
 class Consulta(models.Model):
     STATUS_CHOICES = [
         ('agendada', 'Agendada'),
